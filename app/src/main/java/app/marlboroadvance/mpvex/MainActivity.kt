@@ -1,0 +1,306 @@
+package app.marlboroadvance.mpvex
+
+import android.os.Bundle
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideIn
+import androidx.compose.animation.slideOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.IntOffset
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation3.runtime.NavBackStack
+import androidx.navigation3.runtime.NavEntry
+import androidx.navigation3.runtime.rememberNavBackStack
+import androidx.navigation3.ui.NavDisplay
+import app.marlboroadvance.mpvex.preferences.AppearancePreferences
+import app.marlboroadvance.mpvex.preferences.preference.collectAsState
+import app.marlboroadvance.mpvex.presentation.Screen
+import app.marlboroadvance.mpvex.repository.NetworkRepository
+import app.marlboroadvance.mpvex.utils.update.UpdateDialog
+import app.marlboroadvance.mpvex.utils.update.UpdateViewModel
+import app.marlboroadvance.mpvex.ui.browser.MainScreen
+import app.marlboroadvance.mpvex.ui.browser.TabNavBridge
+import app.marlboroadvance.mpvex.ui.theme.DarkMode
+import app.marlboroadvance.mpvex.ui.theme.MpvexTheme
+import app.marlboroadvance.mpvex.ui.utils.LocalBackStack
+import app.marlboroadvance.mpvex.utils.permission.PermissionUtils
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.withContext
+import org.koin.android.ext.android.inject
+
+/**
+ * Main entry point for the application
+ */
+class MainActivity : ComponentActivity() {
+  private val appearancePreferences by inject<AppearancePreferences>()
+  private val networkRepository by inject<NetworkRepository>()
+  
+  // Create a coroutine scope tied to the activity lifecycle
+  private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+  // Register the ActivityResultLauncher at class level
+  private val mediaAccessLauncher = registerForActivityResult(
+    ActivityResultContracts.StartIntentSenderForResult()
+  ) { result ->
+    PermissionUtils.handleMediaAccessResult(result.resultCode)
+  }
+
+  override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    
+    PermissionUtils.setMediaAccessLauncher(mediaAccessLauncher)
+
+    // Register proxy lifecycle observer for network streaming
+    lifecycle.addObserver(app.marlboroadvance.mpvex.ui.browser.networkstreaming.proxy.ProxyLifecycleObserver())
+
+    setContent {
+      // Set up theme and edge-to-edge display
+      val dark by appearancePreferences.darkMode.collectAsState()
+      val isSystemInDarkTheme = isSystemInDarkTheme()
+      val isDarkMode = dark == DarkMode.Dark || (dark == DarkMode.System && isSystemInDarkTheme)
+      enableEdgeToEdge(
+        SystemBarStyle.auto(
+          lightScrim = Color.White.toArgb(),
+          darkScrim = Color.Transparent.toArgb(),
+        ) { isDarkMode },
+      )
+
+      // Auto-connect to saved network connections
+      LaunchedEffect(Unit) {
+        autoConnectToNetworks()
+      }
+
+      MpvexTheme {
+        Surface {
+          Navigator()
+        }
+      }
+    }
+  }
+
+  override fun onDestroy() {
+    try {
+      super.onDestroy()
+    } catch (e: Exception) {
+      Log.e("MainActivity", "Error during onDestroy", e)
+    }
+  }
+
+  /**
+   * Auto-connect to network connections that are marked for auto-connection
+   */
+  private suspend fun autoConnectToNetworks() {
+    // Delay auto-connect to let UI settle first
+    kotlinx.coroutines.delay(500)
+    
+    // Use coroutineScope for properly structured concurrency
+    withContext(Dispatchers.IO) {
+      try {
+        val autoConnectConnections = networkRepository.getAutoConnectConnections()
+        autoConnectConnections.forEach { connection ->
+          withContext(Dispatchers.Main) {
+            Log.d("MainActivity", "Auto-connecting to: ${connection.name}")
+          }
+          networkRepository.connect(connection)
+            .onSuccess {
+              withContext(Dispatchers.Main) {
+                Log.d("MainActivity", "Auto-connected successfully: ${connection.name}")
+              }
+            }
+            .onFailure { e ->
+              withContext(Dispatchers.Main) {
+                Log.e("MainActivity", "Auto-connect failed for ${connection.name}: ${e.message}")
+              }
+            }
+        }
+      } catch (e: Exception) {
+        withContext(Dispatchers.Main) {
+          Log.e("MainActivity", "Error during auto-connect", e)
+        }
+      }
+    }
+  }
+
+  /**
+   * Navigator that handles screen transitions and provides shared states
+   */
+  @Composable
+  fun Navigator() {
+    val backstack = rememberNavBackStack(MainScreen)
+
+    @Suppress("UNCHECKED_CAST")
+    val typedBackstack = backstack as NavBackStack<Screen>
+
+    val context = LocalContext.current
+    val currentVersion = BuildConfig.VERSION_NAME.replace("-dev", "")
+
+    // Conditionally initialize update feature based on build config
+    val updateViewModel: UpdateViewModel? = if (BuildConfig.ENABLE_UPDATE_FEATURE) {
+      viewModel(context as ComponentActivity)
+    } else {
+      null
+    }
+    val updateState by (updateViewModel?.updateState ?: MutableStateFlow(UpdateViewModel.UpdateState.Idle)).collectAsState()
+    val isDownloading by (updateViewModel?.isDownloading ?: MutableStateFlow(false)).collectAsState()
+    val downloadProgress by (updateViewModel?.downloadProgress ?: MutableStateFlow(0f)).collectAsState()
+
+    // Provide both LocalBackStack and the LazyList/Grid states to all screens
+    CompositionLocalProvider(
+      LocalBackStack provides typedBackstack
+    ) {
+      // 第十五轮 V79：底部 3 tab 提升到 NavDisplay 外层。
+      // 主页点文件夹是 backstack.add(VideoListScreen)，会把整个 MainScreen（连同它的
+      // Scaffold/bottomBar）从导航栈里换掉，所以第十四轮只改 MainScreen 的 visible=true 无效。
+      // 用 Column 把导航条放在所有 route 下方，任何压栈页面都不重叠、也不消失。
+      Column(Modifier.fillMaxSize()) {
+        Box(Modifier.weight(1f)) {
+          NavDisplay(
+        backStack = typedBackstack,
+        onBack = { typedBackstack.removeLastOrNull() },
+        entryProvider = { route -> NavEntry(route) { route.Content() } },
+        popTransitionSpec = {
+          (
+            fadeIn(animationSpec = tween(220)) +
+              slideIn(animationSpec = tween(220)) { IntOffset(-it.width / 2, 0) }
+          ) togetherWith (
+              fadeOut(animationSpec = tween(220)) +
+                slideOut(animationSpec = tween(220)) { IntOffset(it.width / 2, 0) }
+          )
+        },
+        transitionSpec = {
+          (
+            fadeIn(animationSpec = tween(220)) +
+              slideIn(animationSpec = tween(220)) { IntOffset(it.width / 2, 0) }
+          ) togetherWith (
+              fadeOut(animationSpec = tween(220)) +
+                slideOut(animationSpec = tween(220)) { IntOffset(-it.width / 2, 0) }
+          )
+        },
+        predictivePopTransitionSpec = {
+          (
+            fadeIn(animationSpec = tween(220)) +
+              scaleIn(
+                animationSpec = tween(220, delayMillis = 30),
+                initialScale = .9f,
+                TransformOrigin(-1f, .5f),
+              )
+          ) togetherWith (
+              fadeOut(animationSpec = tween(220)) +
+                scaleOut(
+                  animationSpec = tween(220, delayMillis = 30),
+                  targetScale = .9f,
+                  TransformOrigin(-1f, .5f),
+                )
+          )
+        },
+          )
+        }
+        GlobalBottomNav(typedBackstack)
+      }
+
+      // Display Update Dialog when appropriate (only if update feature is enabled)
+      if (BuildConfig.ENABLE_UPDATE_FEATURE && updateViewModel != null) {
+        when (updateState) {
+          is UpdateViewModel.UpdateState.Available -> {
+            val release = (updateState as UpdateViewModel.UpdateState.Available).release
+            UpdateDialog(
+              release = release,
+              isDownloading = isDownloading,
+              progress = downloadProgress,
+              actionLabel = if (isDownloading) "下载中…" else "下载",
+              currentVersion = currentVersion,
+              onDismiss = { updateViewModel.dismiss() },
+              onAction = { updateViewModel.downloadUpdate(release) },
+              onIgnore = { updateViewModel.ignoreVersion(release.tagName.removePrefix("v")) }
+            )
+          }
+          is UpdateViewModel.UpdateState.ReadyToInstall -> {
+            val release = (updateState as UpdateViewModel.UpdateState.ReadyToInstall).release
+            UpdateDialog(
+              release = release,
+              isDownloading = isDownloading,
+              progress = downloadProgress,
+              actionLabel = "安装",
+              currentVersion = currentVersion,
+              onDismiss = { updateViewModel.dismiss() },
+              onAction = { updateViewModel.installUpdate(release) },
+              onIgnore = { updateViewModel.ignoreVersion(release.tagName.removePrefix("v")) }
+            )
+          }
+          else -> {}
+        }
+      }
+    }
+  }
+
+  /**
+   * 第十五轮 V79：全局底部导航。所有 NavDisplay route 共用，包括文件夹详情页、
+   * 设置页等。点任意 tab 先清栈回到 MainScreen，再用 TabNavBridge 切到对应页。
+   */
+  @Composable
+  private fun GlobalBottomNav(backstack: NavBackStack<Screen>) {
+    val active by TabNavBridge.activeTab.collectAsState()
+    NavigationBar {
+      NavigationBarItem(
+        icon = { Icon(Icons.Filled.Home, contentDescription = "主页") },
+        label = { Text("主页") },
+        selected = active == 0,
+        onClick = { goTab(backstack, 0) },
+      )
+      NavigationBarItem(
+        icon = { Icon(Icons.AutoMirrored.Filled.PlaylistPlay, contentDescription = "播放列表") },
+        label = { Text("播放列表") },
+        selected = active == 2,
+        onClick = { goTab(backstack, 2) },
+      )
+      NavigationBarItem(
+        icon = { Icon(Icons.Filled.Sync, contentDescription = "联动") },
+        label = { Text("联动") },
+        selected = active == 4,
+        onClick = { goTab(backstack, 4) },
+      )
+    }
+  }
+
+  private fun goTab(backstack: NavBackStack<Screen>, index: Int) {
+    runCatching {
+      while (backstack.size > 1) backstack.removeLastOrNull()
+    }
+    TabNavBridge.go(index)
+  }
+}

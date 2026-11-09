@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 经典蓝牙 SPP 所需权限由 app 模块统一声明；本模块不声明 UI 组件。 -->
+</manifest>

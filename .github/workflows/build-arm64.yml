@@ -1,0 +1,73 @@
+name: Build ARM64 APK
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build ARM64 release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleStandardRelease --stacktrace
+
+      - name: Sign APK
+        if: github.event_name != 'pull_request'
+        env:
+          SIGNING_KEYSTORE: ${{ secrets.SIGNING_KEYSTORE }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          unsigned="app/build/outputs/apk/standard/release/app-standard-arm64-v8a-release-unsigned.apk"
+          signed="app/build/outputs/apk/standard/release/mpvEx-CN-arm64-v8a-${GITHUB_SHA::7}.apk"
+          echo "$SIGNING_KEYSTORE" | base64 -d > release.keystore
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign \
+            --ks release.keystore \
+            --ks-key-alias "$SIGNING_KEY_ALIAS" \
+            --ks-pass "pass:$SIGNING_STORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --out "$signed" "$unsigned"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$signed"
+          rm release.keystore
+
+      - name: Upload signed ARM64 APK
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpvEx-CN-arm64-${{ github.sha }}
+          path: app/build/outputs/apk/standard/release/mpvEx-CN-arm64-v8a-*.apk
+          if-no-files-found: error
+
+      - name: Upload unsigned PR APK
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpvEx-CN-arm64-pr-${{ github.event.pull_request.number }}
+          path: app/build/outputs/apk/standard/release/app-standard-arm64-v8a-release-unsigned.apk
+          if-no-files-found: error
